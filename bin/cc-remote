@@ -68,14 +68,15 @@ pick_host() {
   fi
 }
 
-# Run a session on TARGET with OPTS. $1 = project (optional).
+# Run cc-session on TARGET with OPTS, forwarding all args. No args -> picker.
 run_remote() {
-  local project="${1:-}"
-  if [ -n "$project" ]; then
+  if [ "$#" -gt 0 ]; then
+    local cmd="cc-session" a
+    for a in "$@"; do cmd="$cmd $(printf '%q' "$a")"; done
     # shellcheck disable=SC2086
-    exec ssh -t $OPTS "$TARGET" "cc-session $(printf '%q' "$project")"
+    exec ssh -t $OPTS "$TARGET" "$cmd"
   fi
-  # No project: fetch candidates from the remote, pick locally, attach the choice.
+  # No args: fetch candidates from the remote, pick locally, attach the choice.
   local cand
   # shellcheck disable=SC2086
   if cand="$(ssh $OPTS "$TARGET" 'cc-session candidates' 2>/dev/null)" && [ -n "$cand" ]; then
@@ -117,7 +118,7 @@ case "$cmd" in
   '')   # no host: pick one
     host="$(pick_host)" || exit 1
     [ -n "$host" ] || exit 1
-    resolve "$host"; run_remote "" ;;
+    resolve "$host"; run_remote ;;
   *)
-    resolve "$cmd"; run_remote "${2:-}" ;;
+    name="$cmd"; shift; resolve "$name"; run_remote "$@" ;;
 esac
