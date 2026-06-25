@@ -15,6 +15,10 @@ set -euo pipefail
 
 CONFIG="${CC_REMOTES:-$HOME/.config/cc-tools/remotes}"
 
+# A non-interactive `ssh host cmd` shell often lacks ~/.local/bin etc. on PATH,
+# so prepend the usual install dirs to every remote command (remote expands $HOME/$PATH).
+RPATH='PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
+
 usage() {
   cat <<EOF
 cc-remote — drive Claude Code on a remote host
@@ -71,7 +75,7 @@ pick_host() {
 # Run cc-session on TARGET with OPTS, forwarding all args. No args -> picker.
 run_remote() {
   if [ "$#" -gt 0 ]; then
-    local cmd="cc-session" a
+    local cmd="$RPATH cc-session" a
     for a in "$@"; do cmd="$cmd $(printf '%q' "$a")"; done
     # shellcheck disable=SC2086
     exec ssh -t $OPTS "$TARGET" "$cmd"
@@ -79,7 +83,7 @@ run_remote() {
   # No args: fetch candidates from the remote, pick locally, attach the choice.
   local cand
   # shellcheck disable=SC2086
-  if cand="$(ssh $OPTS "$TARGET" 'cc-session candidates' 2>/dev/null)" && [ -n "$cand" ]; then
+  if cand="$(ssh $OPTS "$TARGET" "$RPATH cc-session candidates" 2>/dev/null)" && [ -n "$cand" ]; then
     local chosen
     if command -v fzf >/dev/null 2>&1; then
       chosen="$(printf '%s\n' "$cand" | fzf --prompt="$TARGET> " --height=40% --reverse --no-multi || true)"
@@ -92,11 +96,11 @@ run_remote() {
     fi
     [ -n "$chosen" ] || { echo "nothing picked." >&2; exit 1; }
     # shellcheck disable=SC2086
-    exec ssh -t $OPTS "$TARGET" "cc-session $(printf '%q' "${chosen:2}")"
+    exec ssh -t $OPTS "$TARGET" "$RPATH cc-session $(printf '%q' "${chosen:2}")"
   fi
   # Fallback: let the remote run its own picker over an interactive tty.
   # shellcheck disable=SC2086
-  exec ssh -t $OPTS "$TARGET" "cc-session"
+  exec ssh -t $OPTS "$TARGET" "$RPATH cc-session"
 }
 
 cmd="${1:-}"

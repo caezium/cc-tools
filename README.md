@@ -4,6 +4,7 @@ Small, dependency-light CLI utilities for power users of [Claude Code](https://d
 
 | Tool | What it does |
 |------|--------------|
+| [`cc-tools`](bin/cc-tools) | Launcher — run with no args to pick a tool below, or `cc-tools <tool> [args]` to dispatch directly. |
 | [`cc-session`](bin/cc-session) | Run the Claude Code TUI in a persistent, detachable **tmux** session — survives disconnects, reattach anytime. Run it with no args for an interactive **picker** (search running sessions + projects). |
 | [`cc-remote`](bin/cc-remote) | Drive Claude Code on a **remote machine** over SSH from a simple host config — agent + tools run there, TUI renders locally. Picker included. |
 | [`ccron`](bin/ccron) | Manage the **cron jobs Claude schedules for itself** (`scheduled_tasks.json`): list, inspect, pause, resume, delete — independent of any running session. The off-switch for "Claude woke up on its own." |

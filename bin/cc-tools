@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# cc-tools — launcher for the cc-tools suite. Pick a tool, or dispatch directly.
+#
+#   cc-tools                 interactive picker (fzf or numbered) -> runs the tool
+#   cc-tools <tool> [args]   run a tool directly, e.g. cc-tools remote studio
+#   cc-tools ls              list the tools
+#
+# Part of cc-tools: https://github.com/caezium/cc-tools
+set -euo pipefail
+
+VERSION="0.2.2"
+
+# name|description  (names are the actual commands on PATH)
+TOOLS=(
+  "cc-session|persistent tmux Claude Code sessions (interactive picker)"
+  "cc-remote|drive Claude Code on a remote host over SSH"
+  "ccron|manage the cron jobs Claude schedules for itself"
+)
+
+list() { printf '%s\n' "${TOOLS[@]}" | awk -F'|' '{printf "  %-12s %s\n",$1,$2}'; }
+
+run() {  # $1 = tool name (with or without cc- prefix), rest = args
+  local t="$1"; shift || true
+  case "$t" in cc-*) ;; session|remote) t="cc-$t" ;; cron) t="ccron" ;; *) t="$t" ;; esac
+  command -v "$t" >/dev/null 2>&1 || { echo "cc-tools: '$t' not found on PATH" >&2; exit 1; }
+  exec "$t" "$@"
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; echo; echo "Tools:"; list; exit 0 ;;
+  -V|--version) echo "cc-tools $VERSION"; exit 0 ;;
+  ls|list) list; exit 0 ;;
+  "")  # picker
+    if ! { [ -t 0 ] || [ -t 1 ]; }; then list; exit 0; fi
+    line=""
+    if command -v fzf >/dev/null 2>&1; then
+      line="$(printf '%s\n' "${TOOLS[@]}" | awk -F'|' '{printf "%-12s  %s\n",$1,$2}' \
+              | fzf --prompt='cc-tools> ' --height=30% --reverse --no-multi || true)"
+    else
+      i=1; for t in "${TOOLS[@]}"; do printf '%3d) %-12s %s\n' "$i" "${t%%|*}" "${t#*|}" >&2; i=$((i+1)); done
+      printf 'pick [1-%d]: ' "${#TOOLS[@]}" >&2
+      read -r n </dev/tty || exit 1
+      case "$n" in (''|*[!0-9]*) exit 1 ;; esac
+      [ "$n" -ge 1 ] && [ "$n" -le "${#TOOLS[@]}" ] && line="${TOOLS[$((n-1))]}"
+    fi
+    [ -n "$line" ] || exit 1
+    run "$(printf '%s' "$line" | awk '{print $1}')" ;;
+  *) run "$@" ;;
+esac
