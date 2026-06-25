@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# cc-session — attach or create a persistent Claude Code session in tmux.
+#
+# Run the Claude Code TUI inside a named, detachable tmux session so it survives
+# disconnects (close your laptop, drop SSH) and you can reattach later. Pairs well
+# with SSH: run `ssh -t host cc-session <project>` and the TUI renders in your
+# local terminal while the agent + tools execute on the remote host.
+#
+# Part of cc-tools: https://github.com/caezium/cc-tools
+set -euo pipefail
+
+BASE="${CC_BASE:-$HOME/Desktop}"   # where bare project names are resolved
+
+# Find the claude binary: $CLAUDE_BIN, then PATH, then common install locations.
+find_claude() {
+  if [ -n "${CLAUDE_BIN:-}" ] && [ -x "$CLAUDE_BIN" ]; then echo "$CLAUDE_BIN"; return; fi
+  if command -v claude >/dev/null 2>&1; then command -v claude; return; fi
+  for c in "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude" "/usr/local/bin/claude"; do
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+  echo ""   # not found
+}
+
+usage() {
+  cat <<EOF
+cc-session — persistent Claude Code sessions in tmux
+
+Usage:
+  cc-session                 reattach if one session is running, else open \$BASE
+  cc-session <project>       attach/create for \$BASE/<project>   (BASE=$BASE)
+  cc-session <abs-path>      attach/create for an absolute path
+  cc-session .               use the current directory
+  cc-session ls              list running cc sessions
+  cc-session kill <project>  kill a session
+
+Detach from a live session with:  Ctrl-b  then  d
+Env: CC_BASE (project root, default ~/Desktop), CLAUDE_BIN (path to claude)
+EOF
+}
+
+list_sessions() { tmux ls 2>/dev/null | grep '^cc-' || echo "(no running cc sessions)"; }
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+  ls|list)        list_sessions; exit 0 ;;
+  kill)
+    [ -n "${2:-}" ] || { echo "usage: cc-session kill <project>" >&2; exit 1; }
+    tmux kill-session -t "cc-$2" 2>/dev/null && echo "killed cc-$2" \
+      || { echo "no session cc-$2" >&2; exit 1; }
+    exit 0 ;;
+esac
+
+command -v tmux >/dev/null 2>&1 || { echo "cc-session needs tmux (brew install tmux)" >&2; exit 1; }
+
+target="${1:-}"
+
+# Resolve the target directory.
+if [ -z "$target" ]; then
+  running="$(tmux ls 2>/dev/null | grep -c '^cc-' || true)"
+  if [ "${running:-0}" -eq 1 ]; then
+    name="$(tmux ls 2>/dev/null | grep '^cc-' | head -1 | cut -d: -f1)"
+    exec tmux new-session -A -s "$name"
+  fi
+  dir="$BASE"
+elif [ "$target" = "." ]; then
+  dir="$PWD"
+elif [ -d "$target" ]; then
+  dir="$target"
+elif [ -d "$BASE/$target" ]; then
+  dir="$BASE/$target"
+else
+  echo "No such project/dir: '$target' (looked in $BASE)" >&2
+  echo "Running sessions:" >&2; list_sessions >&2
+  exit 1
+fi
+dir="$(cd "$dir" && pwd)"   # normalize to an absolute path
+name="cc-$(basename "$dir")"
+
+claude_bin="$(find_claude)"
+[ -n "$claude_bin" ] || { echo "cc-session: could not find the 'claude' binary (set CLAUDE_BIN)" >&2; exit 1; }
+# Launch via a login shell so PATH/env match an interactive session.
+CC_CMD="${CC_CMD:-${SHELL:-/bin/sh} -l -c '$claude_bin'}"
+
+if [ "${CC_DRY:-0}" = "1" ]; then
+  echo "would attach/create session '$name' in '$dir' running: $CC_CMD"
+  exit 0
+fi
+
+# If already inside tmux, switch instead of nesting.
+if [ -n "${TMUX:-}" ]; then
+  tmux has-session -t "$name" 2>/dev/null \
+    || tmux new-session -d -s "$name" -c "$dir" "$CC_CMD"
+  exec tmux switch-client -t "$name"
+fi
+
+exec tmux new-session -A -s "$name" -c "$dir" "$CC_CMD"

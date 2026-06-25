@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+ccron — manage the cron jobs Claude Code schedules for itself.
+
+Standalone (no deps). Scans the `scheduled_tasks.json` files Claude writes and lets
+you list / inspect / pause / resume / delete them — independent of any Claude session.
+
+These jobs are what make Claude "wake up on its own": each one re-injects a prompt
+into its session on a cron schedule. Deleting/pausing a job here stops that.
+
+USAGE
+  ccron ls                 list all jobs (id, schedule, next run, state, prompt preview)
+  ccron show <id>          full prompt + timing for one job
+  ccron pause <id>         disable a job (keeps it, stops it firing)
+  ccron resume <id>        re-enable a paused job
+  ccron rm <id>            delete one job
+  ccron kill               delete ALL jobs (the big off switch) — asks to confirm
+  ccron kill --yes         delete ALL jobs, no prompt
+  ccron paths              show which scheduler files were found
+
+WHERE IT LOOKS
+  Claude writes scheduled_tasks.json into a project's .claude/ dir (cwd-based) and
+  sometimes the global ~/.claude/. ccron scans ~/.claude, ./.claude, and one level
+  of project dirs under common workspace roots (~, ~/Desktop, ~/projects, ~/code,
+  ~/src). Add more with CCRON_EXTRA_ROOTS (colon-separated) — each root is scanned
+  directly and one level deep.
+
+Notes
+- "pause" sets "enabled": false. Claude's scheduler should honor it; if a build ignores
+  the flag, use `rm`/`kill` to be certain.
+- Edits are written back atomically with a .bak backup beside each file.
+
+Part of cc-tools: https://github.com/caezium/cc-tools
+"""
+import sys, os, json, glob, shutil
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+
+def _extra_roots():
+    raw = os.environ.get("CCRON_EXTRA_ROOTS", "")
+    return [os.path.expanduser(p) for p in raw.split(os.pathsep) if p.strip()]
+
+# Roots scanned directly for <root>/.claude/scheduled_tasks.json
+SCAN_ROOTS = [HOME, os.getcwd()] + _extra_roots()
+# Workspace roots scanned one level deep: <root>/*/.claude/scheduled_tasks.json
+WORKSPACE_ROOTS = [
+    HOME,
+    os.path.join(HOME, "Desktop"),
+    os.path.join(HOME, "projects"),
+    os.path.join(HOME, "code"),
+    os.path.join(HOME, "src"),
+    os.getcwd(),
+] + _extra_roots()
+
+# ---------- dependency-free cron matching ----------
+def _parse_field(expr, lo, hi):
+    vals = set()
+    for part in expr.split(","):
+        step = 1
+        if "/" in part:
+            part, s = part.split("/"); step = int(s)
+        if part in ("*", ""):
+            rng = range(lo, hi + 1)
+        elif "-" in part:
+            a, b = part.split("-"); rng = range(int(a), int(b) + 1)
+        else:
+            rng = range(int(part), int(part) + 1)
+        for v in rng:
+            if lo <= v <= hi and (v - lo) % step == 0:
+                vals.add(v)
+    return vals
+
+def _matches(dt, cron):
+    try:
+        m, h, dom, mon, dow = cron.split()
+    except ValueError:
+        return False
+    M = _parse_field(m, 0, 59); H = _parse_field(h, 0, 23)
+    DOM = _parse_field(dom, 1, 31); MON = _parse_field(mon, 1, 12)
+    DOW = _parse_field(dow, 0, 6)
+    if dt.minute not in M or dt.hour not in H or dt.month not in MON:
+        return False
+    dom_star = dom.strip() == "*"; dow_star = dow.strip() == "*"
+    d_ok = dt.day in DOM
+    w_ok = (dt.weekday() + 1) % 7 in DOW  # cron: 0=Sun
+    if dom_star and dow_star:
+        return True
+    if dom_star:
+        return w_ok
+    if dow_star:
+        return d_ok
+    return d_ok or w_ok
+
+def next_run(cron, after=None):
+    base = after or datetime.now()
+    t = base.replace(second=0, microsecond=0)
+    from datetime import timedelta
+    t += timedelta(minutes=1)
+    for _ in range(366 * 24 * 60):
+        if _matches(t, cron):
+            return t
+        t += timedelta(minutes=1)
+    return None
+
+def human_dt(dt):
+    if dt is None: return "?"
+    delta = (dt - datetime.now()).total_seconds()
+    when = dt.strftime("%a %H:%M")
+    if delta < 0: return f"{when} (past)"
+    if delta < 3600: return f"{when} (in {int(delta//60)}m)"
+    if delta < 86400: return f"{when} (in {int(delta//3600)}h{int((delta%3600)//60)}m)"
+    return f"{when} (in {int(delta//86400)}d)"
+
+def human_ts(ms):
+    if not ms: return "never"
+    try:
+        return datetime.fromtimestamp(ms / 1000).strftime("%b %d %H:%M")
+    except Exception:
+        return str(ms)
+
+# ---------- file scanning ----------
+def find_files():
+    seen, files = set(), []
+    cands = []
+    for root in SCAN_ROOTS:
+        cands.append(os.path.join(root, ".claude", "scheduled_tasks.json"))
+    for root in WORKSPACE_ROOTS:
+        cands.extend(glob.glob(os.path.join(root, "*", ".claude", "scheduled_tasks.json")))
+    for f in cands:
+        rp = os.path.realpath(f)
+        if rp not in seen and os.path.isfile(rp):
+            seen.add(rp); files.append(rp)
+    return files
+
+def load_all():
+    """Return list of (filepath, data_dict, task_dict) for every task."""
+    out = []
+    for f in find_files():
+        try:
+            data = json.load(open(f))
+        except Exception:
+            continue
+        for t in data.get("tasks", []):
+            out.append((f, data, t))
+    return out
+
+def save(filepath, data):
+    shutil.copyfile(filepath, filepath + ".bak")
+    tmp = filepath + ".tmp"
+    json.dump(data, open(tmp, "w"), indent=2)
+    os.replace(tmp, filepath)
+
+# ---------- commands ----------
+def cmd_ls(_):
+    rows = load_all()
+    if not rows:
+        print("No cron jobs scheduled. Claude will not wake up on its own. ✅")
+        return
+    print(f"{'ID':<10} {'STATE':<8} {'SCHEDULE':<14} {'NEXT RUN':<22} {'LAST RUN':<14} PROMPT")
+    print("-" * 110)
+    for f, data, t in rows:
+        cid = t.get("id", "?")
+        cron = t.get("cron", "?")
+        enabled = t.get("enabled", True)
+        state = "ON" if enabled else "paused"
+        nxt = human_dt(next_run(cron)) if enabled else "—"
+        last = human_ts(t.get("lastFiredAt"))
+        prm = " ".join((t.get("prompt", "") or "").split())[:48]
+        print(f"{cid:<10} {state:<8} {cron:<14} {nxt:<22} {last:<14} {prm}")
+    print("-" * 110)
+    print(f"{len(rows)} job(s). Manage: ccron show/pause/resume/rm <id> | ccron kill (stop all)")
+
+def _find(cid):
+    for f, data, t in load_all():
+        if t.get("id") == cid:
+            return f, data, t
+    return None, None, None
+
+def cmd_show(args):
+    if not args: print("usage: ccron show <id>"); return
+    f, data, t = _find(args[0])
+    if not t: print(f"no job with id {args[0]}"); return
+    cron = t.get("cron", "?")
+    print(f"id:        {t.get('id')}")
+    print(f"file:      {f}")
+    print(f"schedule:  {cron}")
+    print(f"enabled:   {t.get('enabled', True)}")
+    print(f"recurring: {t.get('recurring')}")
+    print(f"next run:  {human_dt(next_run(cron)) if t.get('enabled',True) else 'paused'}")
+    print(f"last run:  {human_ts(t.get('lastFiredAt'))}")
+    print(f"created:   {human_ts(t.get('createdAt'))}")
+    print("\n--- prompt ---")
+    print(t.get("prompt", ""))
+
+def _set_enabled(cid, val):
+    f, data, t = _find(cid)
+    if not t: print(f"no job with id {cid}"); return False
+    t["enabled"] = val
+    for i, x in enumerate(data["tasks"]):
+        if x.get("id") == cid: data["tasks"][i] = t
+    save(f, data)
+    return True
+
+def cmd_pause(args):
+    if not args: print("usage: ccron pause <id>"); return
+    if _set_enabled(args[0], False):
+        print(f"paused {args[0]} — it will not fire until you `ccron resume {args[0]}`.")
+        print("(If a Claude build ignores the enabled flag, use `ccron rm` to be certain.)")
+
+def cmd_resume(args):
+    if not args: print("usage: ccron resume <id>"); return
+    if _set_enabled(args[0], True):
+        f, data, t = _find(args[0])
+        print(f"resumed {args[0]} — next run {human_dt(next_run(t.get('cron')))}.")
+
+def cmd_rm(args):
+    if not args: print("usage: ccron rm <id>"); return
+    cid = args[0]
+    f, data, t = _find(cid)
+    if not t: print(f"no job with id {cid}"); return
+    data["tasks"] = [x for x in data["tasks"] if x.get("id") != cid]
+    save(f, data)
+    print(f"deleted {cid}.")
+
+def cmd_kill(args):
+    rows = load_all()
+    if not rows:
+        print("Nothing scheduled. Already fully stopped. ✅"); return
+    if "--yes" not in args and "-y" not in args:
+        print(f"This deletes ALL {len(rows)} scheduled job(s) — the big off switch.")
+        try:
+            if input("Type 'yes' to confirm: ").strip().lower() != "yes":
+                print("aborted."); return
+        except (EOFError, KeyboardInterrupt):
+            print("\naborted."); return
+    files = {}
+    for f, data, t in rows:
+        files[f] = data
+    n = 0
+    for f, data in files.items():
+        n += len(data.get("tasks", []))
+        data["tasks"] = []
+        save(f, data)
+    print(f"deleted {n} job(s) across {len(files)} file(s). Claude will not auto-fire. ✅")
+
+def cmd_paths(_):
+    fs = find_files()
+    if not fs: print("no scheduler files found."); return
+    for f in fs:
+        try: n = len(json.load(open(f)).get("tasks", []))
+        except Exception: n = "?"
+        print(f"{n:>3} job(s)  {f}")
+
+CMDS = {"ls": cmd_ls, "list": cmd_ls, "show": cmd_show, "pause": cmd_pause,
+        "resume": cmd_resume, "rm": cmd_rm, "delete": cmd_rm,
+        "kill": cmd_kill, "stop": cmd_kill, "paths": cmd_paths}
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__); return
+    cmd = args[0]
+    if cmd not in CMDS:
+        print(f"unknown command: {cmd}\n"); print(__doc__); return
+    CMDS[cmd](args[1:])
+
+if __name__ == "__main__":
+    main()
