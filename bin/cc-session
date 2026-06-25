@@ -4,12 +4,13 @@
 # Run the Claude Code TUI inside a named, detachable tmux session so it survives
 # disconnects (close your laptop, drop SSH) and you can reattach later. Pairs well
 # with SSH: run `ssh -t host cc-session <project>` and the TUI renders in your
-# local terminal while the agent + tools execute on the remote host.
+# local terminal while the agent + tools execute on the remote host. See `cc-remote`
+# for a config-driven wrapper around that.
 #
 # Part of cc-tools: https://github.com/caezium/cc-tools
 set -euo pipefail
 
-BASE="${CC_BASE:-$HOME/Desktop}"   # where bare project names are resolved
+BASE="${CC_BASE:-$HOME/Desktop}"   # where bare project names / the picker look
 
 # Find the claude binary: $CLAUDE_BIN, then PATH, then common install locations.
 find_claude() {
@@ -18,7 +19,7 @@ find_claude() {
   for c in "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude" "/usr/local/bin/claude"; do
     [ -x "$c" ] && { echo "$c"; return; }
   done
-  echo ""   # not found
+  echo ""
 }
 
 usage() {
@@ -26,13 +27,16 @@ usage() {
 cc-session — persistent Claude Code sessions in tmux
 
 Usage:
-  cc-session                 reattach if one session is running, else open \$BASE
+  cc-session                 interactive picker (search running sessions + projects)
+  cc-session pick            same picker, explicitly
   cc-session <project>       attach/create for \$BASE/<project>   (BASE=$BASE)
   cc-session <abs-path>      attach/create for an absolute path
   cc-session .               use the current directory
   cc-session ls              list running cc sessions
   cc-session kill <project>  kill a session
+  cc-session candidates      machine-readable list (used by cc-remote)
 
+Picker uses fzf if installed, otherwise a numbered menu.
 Detach from a live session with:  Ctrl-b  then  d
 Env: CC_BASE (project root, default ~/Desktop), CLAUDE_BIN (path to claude)
 EOF
@@ -40,9 +44,60 @@ EOF
 
 list_sessions() { tmux ls 2>/dev/null | grep '^cc-' || echo "(no running cc sessions)"; }
 
+# Emit candidate dirs, one per line, prefixed "● " (running session) or "  " (project).
+candidates() {
+  local seen="|"
+  if command -v tmux >/dev/null 2>&1; then
+    while IFS=$'\t' read -r sname spath; do
+      case "$sname" in
+        cc-*) [ -n "$spath" ] || continue
+              printf '● %s\n' "$spath"; seen="$seen$spath|" ;;
+      esac
+    done < <(tmux list-sessions -F '#{session_name}'$'\t''#{session_path}' 2>/dev/null)
+  fi
+  local d
+  for d in "$BASE"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    case "$seen" in *"|$d|"*) continue ;; esac
+    # By default only show real projects (a repo or an existing Claude workspace);
+    # set CC_ALL_DIRS=1 to list every subdirectory of $BASE.
+    if [ "${CC_ALL_DIRS:-0}" != "1" ]; then
+      [ -d "$d/.git" ] || [ -d "$d/.claude" ] || continue
+    fi
+    printf '  %s\n' "$d"
+  done
+}
+
+# Read candidate lines on stdin, let the user choose one, print the chosen line.
+choose() {
+  local lines=() line
+  while IFS= read -r line; do lines+=("$line"); done
+  [ "${#lines[@]}" -eq 0 ] && { echo "no sessions or projects found under $BASE" >&2; return 1; }
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "${lines[@]}" | fzf --prompt='cc-session> ' --height=40% --reverse --no-multi
+  else
+    local i=1
+    for line in "${lines[@]}"; do printf '%3d) %s\n' "$i" "$line" >&2; i=$((i+1)); done
+    printf 'select [1-%d]: ' "${#lines[@]}" >&2
+    local n; read -r n </dev/tty || return 1
+    case "$n" in (*[!0-9]*|'') return 1 ;; esac
+    [ "$n" -ge 1 ] && [ "$n" -le "${#lines[@]}" ] && printf '%s\n' "${lines[$((n-1))]}"
+  fi
+}
+
+# Resolve a chosen candidate line ("● /path" or "  /path") to its dir, then run us on it.
+pick() {
+  local chosen; chosen="$(candidates | choose)" || return 1
+  [ -n "$chosen" ] || return 1
+  exec "$0" "${chosen:2}"   # strip the 2-char marker
+}
+
 case "${1:-}" in
   -h|--help|help) usage; exit 0 ;;
   ls|list)        list_sessions; exit 0 ;;
+  candidates)     candidates; exit 0 ;;
+  pick)           pick; exit $? ;;
   kill)
     [ -n "${2:-}" ] || { echo "usage: cc-session kill <project>" >&2; exit 1; }
     tmux kill-session -t "cc-$2" 2>/dev/null && echo "killed cc-$2" \
@@ -54,8 +109,9 @@ command -v tmux >/dev/null 2>&1 || { echo "cc-session needs tmux (brew install t
 
 target="${1:-}"
 
-# Resolve the target directory.
+# No argument: launch the picker when interactive; else fall back sensibly.
 if [ -z "$target" ]; then
+  if [ -t 0 ] || [ -t 1 ]; then pick; exit $?; fi
   running="$(tmux ls 2>/dev/null | grep -c '^cc-' || true)"
   if [ "${running:-0}" -eq 1 ]; then
     name="$(tmux ls 2>/dev/null | grep '^cc-' | head -1 | cut -d: -f1)"
@@ -73,12 +129,11 @@ else
   echo "Running sessions:" >&2; list_sessions >&2
   exit 1
 fi
-dir="$(cd "$dir" && pwd)"   # normalize to an absolute path
+dir="$(cd "$dir" && pwd)"
 name="cc-$(basename "$dir")"
 
 claude_bin="$(find_claude)"
 [ -n "$claude_bin" ] || { echo "cc-session: could not find the 'claude' binary (set CLAUDE_BIN)" >&2; exit 1; }
-# Launch via a login shell so PATH/env match an interactive session.
 CC_CMD="${CC_CMD:-${SHELL:-/bin/sh} -l -c '$claude_bin'}"
 
 if [ "${CC_DRY:-0}" = "1" ]; then
@@ -86,7 +141,6 @@ if [ "${CC_DRY:-0}" = "1" ]; then
   exit 0
 fi
 
-# If already inside tmux, switch instead of nesting.
 if [ -n "${TMUX:-}" ]; then
   tmux has-session -t "$name" 2>/dev/null \
     || tmux new-session -d -s "$name" -c "$dir" "$CC_CMD"

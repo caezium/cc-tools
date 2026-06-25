@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# cc-remote — drive Claude Code on a remote machine over SSH.
+#
+# Runs `cc-session` on a configured remote host: the agent + tools execute there
+# while the TUI renders in your local terminal. With no project, it pops an
+# interactive picker of the remote's running sessions + projects (fzf or numbered).
+#
+# Config: ~/.config/cc-tools/remotes   (override with $CC_REMOTES)
+#   one host per line:   <name>  <ssh-target>  [extra ssh options...]
+#   e.g.                 studio  user@100.64.0.10  -i ~/.ssh/studio -o IdentitiesOnly=yes
+# Lines starting with # are comments. The remote must have cc-tools installed too.
+#
+# Part of cc-tools: https://github.com/caezium/cc-tools
+set -euo pipefail
+
+CONFIG="${CC_REMOTES:-$HOME/.config/cc-tools/remotes}"
+
+usage() {
+  cat <<EOF
+cc-remote — drive Claude Code on a remote host
+
+Usage:
+  cc-remote                       pick a host, then pick a session/project
+  cc-remote <name>                pick a session/project on <name>
+  cc-remote <name> <project>      attach/create <project> on <name>
+  cc-remote ls                    list configured remotes
+  cc-remote add <name> <target> [ssh-opts...]   register a remote
+  cc-remote edit                  open the config in \$EDITOR
+
+Config: $CONFIG
+EOF
+}
+
+# Print "name<TAB>target<TAB>opts" for each configured remote.
+remotes() {
+  [ -f "$CONFIG" ] || return 0
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    local name target rest
+    name="$(printf '%s' "$line" | awk '{print $1}')"
+    target="$(printf '%s' "$line" | awk '{print $2}')"
+    rest="$(printf '%s' "$line" | awk '{$1="";$2="";sub(/^  */,"");print}')"
+    printf '%s\t%s\t%s\n' "$name" "$target" "$rest"
+  done < "$CONFIG"
+}
+
+resolve() {  # $1=name -> sets TARGET, OPTS
+  local n="$1" found=""
+  while IFS=$'\t' read -r name target rest; do
+    [ "$name" = "$n" ] && { TARGET="$target"; OPTS="$rest"; found=1; break; }
+  done < <(remotes)
+  [ -n "$found" ] || { echo "cc-remote: no remote named '$n' in $CONFIG" >&2; return 1; }
+}
+
+pick_host() {
+  local names; names="$(remotes | cut -f1)"
+  [ -n "$names" ] || { echo "cc-remote: no remotes configured. Add one: cc-remote add <name> <ssh-target>" >&2; return 1; }
+  if [ "$(printf '%s\n' "$names" | grep -c .)" -eq 1 ]; then printf '%s' "$names"; return; fi
+  if command -v fzf >/dev/null 2>&1; then
+    printf '%s\n' "$names" | fzf --prompt='host> ' --height=30% --reverse --no-multi
+  else
+    local arr=() i=1 l; while IFS= read -r l; do arr+=("$l"); done <<<"$names"
+    for l in "${arr[@]}"; do printf '%3d) %s\n' "$i" "$l" >&2; i=$((i+1)); done
+    printf 'host [1-%d]: ' "${#arr[@]}" >&2
+    local n; read -r n </dev/tty || return 1
+    case "$n" in (*[!0-9]*|'') return 1 ;; esac
+    [ "$n" -ge 1 ] && [ "$n" -le "${#arr[@]}" ] && printf '%s' "${arr[$((n-1))]}"
+  fi
+}
+
+# Run a session on TARGET with OPTS. $1 = project (optional).
+run_remote() {
+  local project="${1:-}"
+  if [ -n "$project" ]; then
+    # shellcheck disable=SC2086
+    exec ssh -t $OPTS "$TARGET" "cc-session $(printf '%q' "$project")"
+  fi
+  # No project: fetch candidates from the remote, pick locally, attach the choice.
+  local cand
+  # shellcheck disable=SC2086
+  if cand="$(ssh $OPTS "$TARGET" 'cc-session candidates' 2>/dev/null)" && [ -n "$cand" ]; then
+    local chosen
+    if command -v fzf >/dev/null 2>&1; then
+      chosen="$(printf '%s\n' "$cand" | fzf --prompt="$TARGET> " --height=40% --reverse --no-multi || true)"
+    else
+      local arr=() i=1 l; while IFS= read -r l; do arr+=("$l"); done <<<"$cand"
+      for l in "${arr[@]}"; do printf '%3d) %s\n' "$i" "$l" >&2; i=$((i+1)); done
+      printf 'select [1-%d]: ' "${#arr[@]}" >&2
+      local n; read -r n </dev/tty || true
+      case "${n:-}" in (''|*[!0-9]*) chosen="" ;; (*) [ "$n" -ge 1 ] && [ "$n" -le "${#arr[@]}" ] && chosen="${arr[$((n-1))]}" ;; esac
+    fi
+    [ -n "$chosen" ] || { echo "nothing picked." >&2; exit 1; }
+    # shellcheck disable=SC2086
+    exec ssh -t $OPTS "$TARGET" "cc-session $(printf '%q' "${chosen:2}")"
+  fi
+  # Fallback: let the remote run its own picker over an interactive tty.
+  # shellcheck disable=SC2086
+  exec ssh -t $OPTS "$TARGET" "cc-session"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  -h|--help|help) usage; exit 0 ;;
+  ls|list)
+    if [ ! -f "$CONFIG" ]; then echo "no remotes (config: $CONFIG)"; exit 0; fi
+    printf '%-12s %-28s %s\n' NAME TARGET "SSH-OPTS"
+    remotes | while IFS=$'\t' read -r n t o; do printf '%-12s %-28s %s\n' "$n" "$t" "$o"; done
+    exit 0 ;;
+  add)
+    [ "$#" -ge 3 ] || { echo "usage: cc-remote add <name> <ssh-target> [ssh-opts...]" >&2; exit 1; }
+    name="$2"; target="$3"; shift 3; opts="$*"
+    mkdir -p "$(dirname "$CONFIG")"
+    printf '%s %s %s\n' "$name" "$target" "$opts" >> "$CONFIG"
+    echo "added '$name' -> $target ${opts:+($opts)}  in $CONFIG"
+    exit 0 ;;
+  edit) exec "${EDITOR:-vi}" "$CONFIG" ;;
+  '')   # no host: pick one
+    host="$(pick_host)" || exit 1
+    [ -n "$host" ] || exit 1
+    resolve "$host"; run_remote "" ;;
+  *)
+    resolve "$cmd"; run_remote "${2:-}" ;;
+esac

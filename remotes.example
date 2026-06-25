@@ -1,0 +1,9 @@
+# cc-remote host config — copy to ~/.config/cc-tools/remotes and edit.
+# One host per line:  <name>  <ssh-target>  [extra ssh options...]
+# Lines starting with # are ignored. The remote must have cc-tools installed too.
+
+# A Mac/Linux box on your Tailscale net, reached with a dedicated key:
+studio    user@100.115.92.10    -i ~/.ssh/studio -o IdentitiesOnly=yes
+
+# A plain host that uses your default SSH config / agent:
+# devbox    user@devbox.example.com
